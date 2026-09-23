@@ -1,0 +1,37 @@
+[project]
+name = "ocr-worker"
+version = "0.1.0"
+description = "Hall ticket barcode worker — FastAPI service that stamps Code128 barcodes into UUCMS hall ticket PDFs"
+readme = "README.md"
+authors = [
+    { name = "Ankith Kumar", email = "ankith.kumar@tenon10.com" }
+]
+requires-python = ">=3.12,<3.14"
+dependencies = [
+    "fastapi[standard]==0.115.6",
+    "boto3==1.36.26",
+    "pillow==11.1.0",
+    "pymongo==4.10.1",
+    "pymupdf==1.25.3",
+    "prometheus-client==0.21.1",
+    "python-barcode==0.15.1",
+    "python-dotenv==1.2.3",
+    "python-multipart==0.0.20",
+    "redis==5.2.1",
+    "uvicorn[standard]==0.34.0",
+]
+
+# Deployable app, not an installable library. Run with:
+# `uv run uvicorn app.main:app`.
+[tool.uv]
+package = false
+
+[dependency-groups]
+dev = [
+    "pytest==8.3.4",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: requires configured MongoDB, Redis, and Supabase services",
+]
