@@ -18,7 +18,8 @@ import logging
 import os
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from typing import Callable, TypeVar
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -59,6 +60,42 @@ class ProcessRequest(BaseModel):
     job_id: str
     object_key: str
     filename: str
+
+
+_T = TypeVar("_T")
+
+_CONNECT_RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0, 15.0)
+
+
+async def _connect_with_retry(
+    label: str,
+    connect: Callable[[], _T],
+    attempts: int = len(_CONNECT_RETRY_DELAYS) + 1,
+) -> _T:
+    """Run a blocking connect call, retrying transient failures with backoff.
+
+    A momentary DNS or TCP blip (common on container hosts) must not take the
+    whole deployment down, so boot rides it out before giving up.
+    """
+    last_error: BaseException | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return await asyncio.to_thread(connect)
+        except Exception as exc:  # noqa: BLE001 - any dependency error is retryable here
+            last_error = exc
+            if attempt == attempts:
+                break
+            delay = _CONNECT_RETRY_DELAYS[min(attempt - 1, len(_CONNECT_RETRY_DELAYS) - 1)]
+            logger.warning(
+                "%s connect attempt %d/%d failed (%s); retrying in %.1fs",
+                label,
+                attempt,
+                attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+    raise RuntimeError(f"{label} unavailable after {attempts} attempts: {last_error}") from last_error
 
 
 async def _queue_worker():
@@ -112,23 +149,55 @@ async def _queue_worker():
         )
 
 
+async def _supervise_queue_worker():
+    """Keep the queue consumer alive.
+
+    A crashed worker previously died silently and stopped draining the queue
+    while /health still reported ok, so processing just stalled.
+    """
+    backoff = 1.0
+    while True:
+        try:
+            await _queue_worker()
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Queue worker crashed; restarting in %.1fs", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+
+
 # ─── App lifecycle ───────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Start the eviction loop on startup."""
+    """Connect dependencies with retries, then run the queue worker."""
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured")
-    app.state.redis = Redis.from_url(redis_url, decode_responses=True)
-    app.state.redis.ping()
-    app.state.mongo = MongoStorage()
-    app.state.mongo.mark_processing_jobs_interrupted()
-    task = asyncio.create_task(_queue_worker())
+    app.state.redis = Redis.from_url(
+        redis_url,
+        decode_responses=True,
+        socket_connect_timeout=5,
+        socket_timeout=30,
+        health_check_interval=30,
+        retry_on_timeout=True,
+    )
+    await _connect_with_retry("Redis", app.state.redis.ping)
+
+    app.state.mongo = await _connect_with_retry("MongoDB", MongoStorage)
+    await _connect_with_retry(
+        "MongoDB recovery", app.state.mongo.mark_processing_jobs_interrupted
+    )
+
+    app.state.worker_task = asyncio.create_task(_supervise_queue_worker())
     try:
         yield
     finally:
-        task.cancel()
+        app.state.worker_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await app.state.worker_task
         app.state.mongo.close()
         await asyncio.to_thread(app.state.redis.close)
 
@@ -289,16 +358,29 @@ async def get_result(job_id: str):
 @app.get("/health")
 async def health():
     """Health check endpoint."""
-    await asyncio.to_thread(app.state.redis.ping)
-    queued_jobs = await asyncio.to_thread(app.state.redis.llen, QUEUE_KEY)
-    processing_jobs = await asyncio.to_thread(
-        app.state.redis.llen, PROCESSING_QUEUE_KEY
-    )
+    worker_alive = not app.state.worker_task.done()
+    try:
+        await asyncio.to_thread(app.state.redis.ping)
+        queued_jobs = await asyncio.to_thread(app.state.redis.llen, QUEUE_KEY)
+        processing_jobs = await asyncio.to_thread(
+            app.state.redis.llen, PROCESSING_QUEUE_KEY
+        )
+    except Exception as exc:  # noqa: BLE001 - report, never 500 the probe
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "redis": "unavailable",
+                "worker_alive": worker_alive,
+                "detail": str(exc),
+            },
+            status_code=503,
+        )
     return {
-        "status": "ok",
+        "status": "ok" if worker_alive else "degraded",
         "queued_jobs": queued_jobs,
         "processing_jobs": processing_jobs,
         "redis": "ok",
+        "worker_alive": worker_alive,
     }
 
 
