@@ -172,7 +172,11 @@ async def _supervise_queue_worker():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Connect dependencies with retries, then run the queue worker."""
+    """Connect dependencies with retries, then run the queue worker.
+
+    A dependency that cannot be reached degrades the service instead of killing
+    it, so diagnostics and /health stay available while the network is fixed.
+    """
     redis_url = os.getenv("REDIS_URL")
     if not redis_url:
         raise RuntimeError("REDIS_URL is not configured")
@@ -184,12 +188,24 @@ async def lifespan(app: FastAPI):
         health_check_interval=30,
         retry_on_timeout=True,
     )
-    await _connect_with_retry("Redis", app.state.redis.ping)
 
-    app.state.mongo = await _connect_with_retry("MongoDB", MongoStorage)
-    await _connect_with_retry(
-        "MongoDB recovery", app.state.mongo.mark_processing_jobs_interrupted
-    )
+    try:
+        await _connect_with_retry("Redis", app.state.redis.ping, attempts=3)
+        app.state.redis_error = None
+    except Exception as exc:  # noqa: BLE001 - report and degrade, never exit
+        app.state.redis_error = str(exc)
+        logger.error("Redis unavailable at startup; serving degraded: %s", exc)
+
+    try:
+        app.state.mongo = await _connect_with_retry("MongoDB", MongoStorage, attempts=3)
+        await _connect_with_retry(
+            "MongoDB recovery", app.state.mongo.mark_processing_jobs_interrupted, attempts=2
+        )
+        app.state.mongo_error = None
+    except Exception as exc:  # noqa: BLE001 - report and degrade, never exit
+        app.state.mongo = None
+        app.state.mongo_error = str(exc)
+        logger.error("MongoDB unavailable at startup; serving degraded: %s", exc)
 
     app.state.worker_task = asyncio.create_task(_supervise_queue_worker())
     try:
@@ -198,7 +214,8 @@ async def lifespan(app: FastAPI):
         app.state.worker_task.cancel()
         with suppress(asyncio.CancelledError):
             await app.state.worker_task
-        app.state.mongo.close()
+        if app.state.mongo is not None:
+            app.state.mongo.close()
         await asyncio.to_thread(app.state.redis.close)
 
 
@@ -359,6 +376,20 @@ async def get_result(job_id: str):
 async def health():
     """Health check endpoint."""
     worker_alive = not app.state.worker_task.done()
+    redis_ok = app.state.redis_error is None
+    mongo_ok = app.state.mongo is not None
+    if not (redis_ok and mongo_ok and worker_alive):
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "redis": "ok" if redis_ok else "unavailable",
+                "mongodb": "ok" if mongo_ok else "unavailable",
+                "worker_alive": worker_alive,
+                "redis_error": app.state.redis_error,
+                "mongodb_error": app.state.mongo_error,
+            },
+            status_code=503,
+        )
     try:
         await asyncio.to_thread(app.state.redis.ping)
         queued_jobs = await asyncio.to_thread(app.state.redis.llen, QUEUE_KEY)
@@ -370,6 +401,7 @@ async def health():
             {
                 "status": "degraded",
                 "redis": "unavailable",
+                "mongodb": "ok",
                 "worker_alive": worker_alive,
                 "detail": str(exc),
             },
@@ -382,6 +414,38 @@ async def health():
         "redis": "ok",
         "worker_alive": worker_alive,
     }
+
+
+_DIAG_HOSTS = (
+    "poetic-grubworm-307000.upstash.io",
+    "merry-tortoise-145415.upstash.io",
+    "global-as1.upstash.io",
+    "testing-cluster.6o3znin.mongodb.net",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "github.com",
+    "google.com",
+)
+
+
+def _resolve(host: str) -> dict:
+    import socket
+
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception as exc:  # noqa: BLE001 - diagnostic reports every failure
+        return {"host": host, "resolves": False, "error": str(exc)}
+    families = sorted({f"[{ai[4][0]}]" for ai in infos})
+    return {"host": host, "resolves": True, "addresses": families}
+
+
+@app.get("/diag/dns")
+async def diag_dns():
+    """Report which hosts this container can actually resolve."""
+    results = await asyncio.gather(
+        *(asyncio.to_thread(_resolve, host) for host in _DIAG_HOSTS)
+    )
+    return {"results": list(results)}
 
 
 @app.get("/metrics")
